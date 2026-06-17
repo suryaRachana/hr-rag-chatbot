@@ -113,10 +113,33 @@ def is_hr_related(question):
 
 @st.cache_resource(show_spinner=False)
 def load_pipeline():
+    # Step 1 - Get Groq API key
     groq_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY", ""))
+    if not groq_key:
+        raise ValueError("GROQ_API_KEY not found in secrets!")
     os.environ["GROQ_API_KEY"] = groq_key
+
+    # Step 2 - Find PDF files
     pdf_dir = st.secrets.get("PDF_DIR", os.getenv("PDF_DIR", "./hr_docs"))
     pdf_paths = sorted(glob.glob(os.path.join(pdf_dir, "*.pdf")))
+    if not pdf_paths:
+        # Try alternative paths
+        alt_paths = [
+            "./hr_docs/*.pdf",
+            "hr_docs/*.pdf",
+            "/app/hr_docs/*.pdf",
+        ]
+        for alt in alt_paths:
+            pdf_paths = sorted(glob.glob(alt))
+            if pdf_paths:
+                break
+    if not pdf_paths:
+        raise FileNotFoundError(
+            f"No PDF files found in '{pdf_dir}'! "
+            f"Please make sure the hr_docs folder contains the 11 HR policy PDFs."
+        )
+
+    # Step 3 - Load PDFs
     all_docs = []
     for path in pdf_paths:
         loader = PyPDFLoader(path)
@@ -124,22 +147,32 @@ def load_pipeline():
         for doc in docs:
             doc.metadata["source"] = Path(path).name
         all_docs.extend(docs)
+
+    # Step 4 - Chunk
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500, chunk_overlap=200,
         separators=["\n\n", "\n", ". ", " ", ""],
     )
     chunks = splitter.split_documents(all_docs)
+
+    # Step 5 - Embeddings
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
         model_kwargs={"device": "cpu"},
         encode_kwargs={"normalize_embeddings": True},
     )
+
+    # Step 6 - Vector store
     vectorstore = FAISS.from_documents(chunks, embeddings)
     retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={"k": 8, "fetch_k": 30, "lambda_mult": 0.7},
     )
+
+    # Step 7 - LLM
     llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.1, max_tokens=512)
+
+    # Step 8 - Prompt
     prompt = ChatPromptTemplate.from_messages([
         ("system", """You are an HR assistant for Zyro Dynamics Pvt. Ltd.
 Your ONLY knowledge source is the HR policy document excerpts provided below.
@@ -154,22 +187,30 @@ RULES:
 --- END CONTEXT ---"""),
         ("human", "{question}"),
     ])
+
     def fmt(docs):
         return "\n\n".join(
             f"[{i}. {doc.metadata.get('source','Unknown')}]\n{doc.page_content}"
             for i, doc in enumerate(docs, 1)
         )
+
     chain = (
         {"context": retriever | fmt, "question": RunnablePassthrough()}
         | prompt | llm | StrOutputParser()
     )
+
     return chain, retriever, len(chunks), len(pdf_paths)
 
-# Sidebar
+
+# ── Sidebar ──────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🏢 Zyro Dynamics")
     st.markdown("### HR Help Desk")
     st.markdown("---")
+
+    pipeline_ok = False
+    error_msg = ""
+
     with st.spinner("Loading HR documents..."):
         try:
             chain, retriever, n_chunks, n_pdfs = load_pipeline()
@@ -177,9 +218,19 @@ with st.sidebar:
             st.success("✅ Pipeline Ready!")
             st.metric("Policy Documents", n_pdfs)
             st.metric("Indexed Chunks", n_chunks)
+        except FileNotFoundError as e:
+            pipeline_ok = False
+            error_msg = str(e)
+            st.error(f"📁 PDF Error: {e}")
+        except ValueError as e:
+            pipeline_ok = False
+            error_msg = str(e)
+            st.error(f"🔑 Key Error: {e}")
         except Exception as e:
             pipeline_ok = False
-            st.error(f"Error: {e}")
+            error_msg = str(e)
+            st.error(f"❌ Error: {e}")
+
     st.markdown("---")
     st.markdown("### 💡 Quick Questions")
     quick = [
@@ -192,15 +243,17 @@ with st.sidebar:
     for q in quick:
         if st.button(q, use_container_width=True):
             st.session_state["prefill"] = q
+
     st.markdown("---")
     st.markdown("### 📚 Policy Documents")
-    for d in ["Company Profile","Employee Handbook","Leave Policy",
-              "WFH Policy","Code of Conduct","Performance Review",
-              "Compensation & Benefits","IT & Data Security",
-              "POSH Policy","Onboarding & Separation","Travel & Expense"]:
+    for d in ["Company Profile", "Employee Handbook", "Leave Policy",
+              "WFH Policy", "Code of Conduct", "Performance Review",
+              "Compensation & Benefits", "IT & Data Security",
+              "POSH Policy", "Onboarding & Separation", "Travel & Expense"]:
         st.markdown(f"• {d}")
 
-# Header
+
+# ── Header ────────────────────────────────────────────────────
 st.markdown("""
 <div class="header">
   <h1>🏢 Zyro Dynamics HR Help Desk</h1>
@@ -208,7 +261,13 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# Chat state
+# Show error details if pipeline failed
+if not pipeline_ok and error_msg:
+    st.error(f"⚠️ Pipeline failed: {error_msg}")
+    st.info("Please check: 1) GROQ_API_KEY in secrets, 2) hr_docs folder has 11 PDFs")
+    st.stop()
+
+# ── Chat state ────────────────────────────────────────────────
 if "history" not in st.session_state:
     st.session_state.history = [{
         "role": "bot",
@@ -217,7 +276,7 @@ if "history" not in st.session_state:
         "oos": False,
     }]
 
-# Render chat
+# ── Render chat ───────────────────────────────────────────────
 for msg in st.session_state.history:
     if msg["role"] == "user":
         st.markdown(f'<div class="bubble-user">{msg["content"]}</div>', unsafe_allow_html=True)
@@ -229,29 +288,26 @@ for msg in st.session_state.history:
             content = msg["content"].replace("\n", "<br>")
             st.markdown(f'<div class="bubble-bot">{content}<br>{chips}</div>', unsafe_allow_html=True)
 
-# Handle prefill
+# ── Handle prefill ────────────────────────────────────────────
 prefill = st.session_state.pop("prefill", None)
 user_input = st.chat_input("Ask an HR policy question...")
 if not user_input and prefill:
     user_input = prefill
 
-# Process input
+# ── Process input ─────────────────────────────────────────────
 if user_input:
-    if not pipeline_ok:
-        st.error("Pipeline not ready!")
-    else:
-        st.session_state.history.append({"role": "user", "content": user_input, "sources": [], "oos": False})
-        with st.spinner("Searching HR policies..."):
-            if not is_hr_related(user_input):
-                answer = REFUSAL_MESSAGE
-                sources = []
-                oos = True
-            else:
-                docs = retriever.invoke(user_input)
-                sources = list({doc.metadata.get("source", "Unknown") for doc in docs})
-                answer = chain.invoke(user_input)
-                oos = False
-        st.session_state.history.append({"role": "bot", "content": answer, "sources": sources, "oos": oos})
-        st.rerun()
+    st.session_state.history.append({"role": "user", "content": user_input, "sources": [], "oos": False})
+    with st.spinner("Searching HR policies..."):
+        if not is_hr_related(user_input):
+            answer = REFUSAL_MESSAGE
+            sources = []
+            oos = True
+        else:
+            docs = retriever.invoke(user_input)
+            sources = list({doc.metadata.get("source", "Unknown") for doc in docs})
+            answer = chain.invoke(user_input)
+            oos = False
+    st.session_state.history.append({"role": "bot", "content": answer, "sources": sources, "oos": oos})
+    st.rerun()
 
 st.markdown("<br><center style='color:#99AABB; font-size:0.78rem;'>Zyro Dynamics HR Help Desk · Answers based on internal policy documents only</center>", unsafe_allow_html=True)
